@@ -1,0 +1,920 @@
+<html>
+<head>
+<meta charset="utf-8">
+<title>IMPROS - Improve Your Prosody Vs 1.0</title>
+
+<link rel="stylesheet" type="text/css" href="impros.css">
+
+<script type="text/javascript" src="flotr2.min.js"></script>
+<script type="text/javascript" src="AudioContextMonkeyPatch.js"></script>
+<script type="text/javascript" src="filter.min.js"></script>
+<script type="text/javascript" src="loess.min.js"></script>
+<script>
+//
+// (c) 2015 Mark Huckvale University College London
+//
+// manifest constants
+var SRATE=48000;	// sampling rate (fixed by Audio object)
+var FXRATE=200;   // fundamental frequency rate
+var MAXRECORD=10;	// maximum recording = 10s
+
+// lesson
+var title="Type main title for lesson";
+var subtitle="Type subtitle for lesson";
+var wlist=[];
+
+// audio
+var context=null;
+var micsource=null;
+var capturenode=null;
+var recording=0;
+var	sendsrc;
+
+// audio captured
+var csigcap=[];
+var csignal=new Float32Array(SRATE);
+var cfx=[];
+var cvs=[];
+var cfxlen=0;
+var cfxlo=50,cfxhi=500;
+var	ctab=[];
+var	cdata=[];
+
+var flcursor=-1;
+var frcursor=-1;
+var fstack=[];
+
+var	wavegraph;
+var	pitchgraph;
+var	annotgraph;
+
+// utility function
+function $(obj) { return document.getElementById(obj); }
+
+// send a message to the console
+function trace(message){
+	console.log(message);
+}
+
+// get screen size and calculate co-ordinates of screen centre
+function screensize()
+{
+	var e = window, a = 'inner';
+	if ( !( 'innerWidth' in window ) ) {
+		a = 'client';
+		e = document.documentElement || document.body;
+	}
+	return { width : e[a+'Width'], height : e[a+'Height'], cx : e[ a+'Width' ]/2 , cy : e[ a+'Height' ]/2 }
+}
+
+
+// display the recorded signal
+function displaysignal(target)
+{
+	var
+		container = document.getElementById(target),
+		data, cldata, crdata, i, factor, min, max;
+
+	// get start and length from stack
+	var ssamp = Math.round(fstack[0][0]*SRATE);
+	var esamp = Math.round(fstack[0][1]*SRATE);
+	var nsamp = esamp-ssamp;
+
+	// temporal compression factor for faster drawing - assume max 2000 pixels
+	factor=Math.floor(nsamp/2000);
+	if (factor < 1) factor=1;
+
+	// load signal into graph
+	data = [];
+	for (i=0;i<csignal.length;i+=factor) {
+		min=csignal[ssamp+i];
+		max=csignal[ssamp+i];
+		for (j=1;j<factor;j++) {
+			if (csignal[ssamp+i+j] < min) min=csignal[ssamp+i+j];
+			if (csignal[ssamp+i+j] > max) max=csignal[ssamp+i+j];
+		}
+		data.push([ (i+ssamp)/SRATE, min ]);
+		if (min!=max) data.push([ (i+ssamp)/SRATE, max ]);
+	}
+
+	cldata = [];
+	if ((0<flcursor)&&(flcursor<csignal.length/SRATE)) {
+		cldata.push( [ flcursor, -1 ]);
+		cldata.push( [ flcursor, 1 ]);
+	}
+	crdata = [];
+	if ((0<frcursor)&&(frcursor<csignal.length/SRATE)) {
+		crdata.push( [ frcursor, -1 ]);
+		crdata.push( [ frcursor, 1 ]);
+	}
+
+	// Draw Graph
+	wavegraph = Flotr.draw(container, [ data, cldata, crdata ], {
+		shadowSize : 0,
+		xaxis : {
+			title : "Time (s)",
+			min : fstack[0][0],
+			max : fstack[0][1]
+		},
+		yaxis : {
+			title : "Amplitude",
+			titleAngle : 90,
+			min: -1.0,
+			max: 1.0
+		},
+		HtmlText : false,
+		grid: {
+		  backgroundColor: "white"
+		}
+	} );
+
+}
+
+// display the pitch track
+function displaypitch(target)
+{
+	var
+		container = document.getElementById(target),
+		data, cldata, crdata, i, factor, min, max;
+
+	// get start and length from stack
+	var ssamp = Math.round(fstack[0][0]*FXRATE);
+	var esamp = Math.round(fstack[0][1]*FXRATE);
+	var nsamp = esamp-ssamp;
+
+	// load signal into graph
+	data = [];
+	for (i=0;i<nsamp;i++) {
+		data.push([ (i+ssamp)/FXRATE, cfx[ssamp+i] ]);
+	}
+
+	cldata = [];
+	if ((0<flcursor)&&(flcursor<csignal.length/SRATE)) {
+		cldata.push( [ flcursor, cfxlo ]);
+		cldata.push( [ flcursor, cfxhi ]);
+	}
+	crdata = [];
+	if ((0<frcursor)&&(frcursor<csignal.length/SRATE)) {
+		crdata.push( [ frcursor, cfxlo ]);
+		crdata.push( [ frcursor, cfxhi ]);
+	}
+
+	// Draw Graph
+	pitchgraph = Flotr.draw(container,
+	   [ { data:data, points: { show:true }}, cldata, crdata ], {
+		shadowSize : 0,
+		xaxis : {
+			title : "Time (s)",
+			min : fstack[0][0],
+			max : fstack[0][1]
+		},
+		yaxis : {
+			title : "Fundamental Frequency (Hz)",
+			titleAngle : 90,
+			min: cfxlo*0.9,
+			max: cfxhi*1.1
+		},
+		HtmlText : false,
+		grid: {
+		  backgroundColor: "white"
+		}
+	} );
+
+}
+
+// display the annotations
+function displayannot(target)
+{
+	var
+		container = document.getElementById(target),
+		data=[], markers=[], i,cols=['#CCFFCC','#FFFFCC'];
+
+	for (i=0;i<ctab.length;i++) {
+		if (i+1<ctab.length)
+			data.push( { data:[ [ ctab[i].start, 0, ctab[i+1].start-ctab[i].start] ], timeline:{ show:true, barWidth:1 } } );
+		else
+			data.push( { data:[ [ ctab[i].start, 0, csignal.length/SRATE-ctab[i].start] ], timeline:{ show:true, barWidth:1 } } );
+		markers.push([ ctab[i].start, 0]);
+	}
+	data.push({ data:markers, markers:{ show:true, position:'rm', fontSize:11,
+		labelFormatter: function (o) { return ctab[o.index].wrd; } } } );
+
+	annotgraph=Flotr.draw(container,data, {
+		xaxis : {
+			title : "Time (s)",
+			min : fstack[0][0],
+			max : fstack[0][1]
+		},
+		yaxis: {
+			title : "Words",
+			titleAngle : 90,
+			min:-0.5, max:0.5
+		},
+		HtmlText : false,
+		grid: {
+			backgroundColor: "white",
+			horizontalLines: false
+		}
+	});
+}
+
+// adjust annotation timing
+function adjustannot()
+{
+	var etime=csignal.length/SRATE;
+
+	for (var i=0;i<ctab.length-1;i++)
+		ctab[i].stop=ctab[i+1].start;
+	ctab[ctab.length-1].stop=etime;
+}
+
+
+var pitchworker=null;
+
+// calculate pitch
+function dopitch()
+{
+	// downsample by 3 before analysis
+	var nfsamp=Math.floor(csignal.length/3);
+	var ffsignal=new Float32Array(nfsamp);
+	var filt=new Filter();
+	filt.design(filt.LOW_PASS,4,SRATE/3,SRATE/3,SRATE);
+	for (var i=0;i<nfsamp;i++) {
+		filt.sample(csignal[3*i]);
+		filt.sample(csignal[3*i+1]);
+		ffsignal[i]=filt.sample(csignal[3*i+2]);
+	}
+
+	// create worker thread for calculation
+	pitchworker= new Worker("fxswipe.min.js");
+	pitchworker.onmessage=function(event) {
+		console.timeEnd("FXSwipe");
+		cfx=event.data.fx;
+	 	cvs=event.data.vs;
+		cfxlen=event.data.fxlen;
+		// smooth
+		var	x=new Array(cfx.length);
+		for (i=0;i<cfx.length;i++) x[i] = i/FXRATE;
+		cfx=smoothfxloess(x,cfx,cvs);
+		// find fx min & max
+		cfxlo=500;
+		cfxhi=50;
+		for (var i=0;i<cfx.length;i++) {
+			if (cfx[i] < cfxlo) cfxlo=cfx[i];
+			if (cfx[i] > cfxhi) cfxhi=cfx[i];
+		}
+		if (cfxlo < 50) cfxlo=50;
+		if (cfxhi > 500) cfxhi=500;
+		// draw pitch track
+		displaypitch("fgraph");
+	}
+
+	// generate pitch in worker thread
+	console.time("FXSwipe");
+	pitchworker.postMessage({ signal : ffsignal, srate: SRATE/3 });
+
+}
+
+// create audio context
+function createcontext()
+{
+	// create context - once only
+	if (context==null) {
+		try {
+			context = new window.AudioContext();
+//			trace("context.sampleRate="+context.sampleRate);
+			SRATE=context.sampleRate;
+			//context.createGainNode();		// this may be a fix for iPad
+		}
+		catch(e) {
+			alert('Web Audio API is not supported in this browser. Try Chrome, Firefox or Safari.');
+		}
+	}
+}
+
+// stop recording
+function doStop()
+{
+	if (recording) {
+		$('recmask').style.visibility='hidden';
+		$('recorddlg').style.visibility='hidden';
+		recording=0;
+//		trace("Got "+csigcap.length+" samples");
+		csignal=new Float32Array(csigcap.length);
+		for (var i=0;i<csigcap.length;i++) csignal[i]=csigcap[i]/csigmax;
+		// initialise time stack
+		fstack=[];
+		fstack.push([0, csignal.length/SRATE]);
+		displaysignal("wgraph");
+		dopitch()
+	}
+	else
+		sendsrc.stop();
+}
+
+function onrecorddlg()
+{
+	doStop();
+}
+
+// draw VU meter
+var lastvu=-50;
+
+function setvumeter(peak)
+{
+	var canvas=document.getElementById("vumeter");
+	var ctx=canvas.getContext('2d');
+	ctx.font="bold 20px Arial";
+	ctx.clearRect(0,0,canvas.width,canvas.height);
+	ctx.fillStyle="rgb(128,128,128)";
+	ctx.textAlign="center";
+	var vu=20*Math.log10(peak);
+	if (vu < lastvu)
+		lastvu = 0.75*lastvu+0.25*vu;
+	else
+		lastvu = vu;
+	var width=Math.floor(190+3*lastvu);
+	if (width < 0) width=0;
+//	ctx.fillText(vu, 100, 40);
+	ctx.fillStyle = "rgb(200, 0, 0)";
+    ctx.fillRect (5, 5, width, 40);
+}
+
+// start audio processing
+function startrecording(stream)
+{
+	micsource = context.createMediaStreamSource(stream);
+	capturenode = context.createScriptProcessor(8192, 1, 1);
+	capturenode.onaudioprocess = function(e) {
+		if (recording) {
+			var buf=e.inputBuffer.getChannelData(0);
+			var peak=0;
+			for (i=0;i<buf.length;i++) {
+				if (buf[i] > csigmax) csigmax = buf[i];
+				if (buf[i] < -csigmax) csigmax = -buf[i];
+				if (buf[i] > peak) peak = buf[i];
+				if (buf[i] < -peak) peak = -buf[i];
+				csigcap.push(buf[i]);
+			}
+			if (csigcap.length/SRATE > MAXRECORD) doStop();
+			setvumeter(peak);
+		}
+	};
+
+	// connect microphone to processing node
+	micsource.connect(capturenode);
+	capturenode.connect(context.destination);
+
+}
+
+// start/pause recording
+function doRecord()
+{
+	createcontext();
+
+	if (!recording) {
+		csigmax=0;
+		csigcap = new Array();
+	}
+
+	if (micsource==null) {
+		navigator.getMedia = ( navigator.getUserMedia ||
+                         navigator.webkitGetUserMedia ||
+                         navigator.mozGetUserMedia ||
+                         navigator.msGetUserMedia);
+
+		navigator.getMedia({audio:true}, startrecording, function() { alert('getUserMedia() failed'); });
+	}
+
+	// start/pause function
+	if (recording) {
+		$('recmask').style.visibility='hidden';
+		$('recorddlg').style.visibility='hidden';
+		recording=0;
+//		trace("Got "+csigcap.length+" samples");
+		csignal=new Float32Array(csigcap.length);
+		for (var i=0;i<csigcap.length;i++) csignal[i]=csigcap[i]/csigmax;
+		// initialise time stack
+		fstack=[];
+		fstack.push([0, csignal.length/SRATE]);
+		displaysignal("wgraph");
+		dopitch();
+	}
+	else {
+		$('recmask').style.visibility='visible';
+		var dlg=$('recorddlg');
+		var rpos = $('recmask').getBoundingClientRect();
+		var voffset=(rpos.height - dlg.offsetHeight)/2;
+		dlg.style.top = (rpos.top + voffset) + "px";
+		dlg.style.left = (screensize().cx - dlg.offsetWidth/2) + "px";
+		dlg.style.visibility='visible';
+		recording=1;
+	}
+
+}
+
+// play some audio
+function playaudio(sig,stime,etime)
+{
+	var ssamp=Math.floor(stime*SRATE);
+	var esamp=Math.floor(etime*SRATE);
+	var nsamp = esamp-ssamp;
+	if (nsamp <= 0) return;
+
+	// create audio buffer source node
+	sendsrc = context.createBufferSource();
+	sendbuf = context.createBuffer(1,nsamp,SRATE);
+
+	// copy in the signal
+	senddat = sendbuf.getChannelData(0);
+	for (i=0;i<nsamp;i++) senddat[i] = sig[ssamp+i];
+
+	// kick it off
+	sendsrc.buffer = sendbuf;
+	sendsrc.loop = false;
+	sendsrc.connect(context.destination);
+	sendsrc.start(context.currentTime + 0.001);		// this may be a fix for iPad
+}
+
+// detect mouse click on cpanel
+function cpanelclick(evt)
+{
+	evt = evt || window.event;
+	var rect = $('cpanel').getBoundingClientRect();
+	var x= evt.clientX - rect.left;
+	for (var i=0;i<ftab.length;i++) {
+		if ((ctab[i].xl <= x) && (x <= ctab[i].xr)) {
+			playaudio(csignal,ctab[i].start,ctab[i].stop);
+			return;
+		}
+	}
+}
+
+// play student recording
+function doPlay()
+{
+	playaudio(csignal,0,csignal.length/SRATE);
+}
+
+function oncontextmenu(evt)
+{
+	evt = evt || window.event;
+	evt.preventDefault();
+	evt.stopPropagation();
+	return false;
+}
+
+// dialog cancel button handler
+function cancel(dlg)
+{
+	$('mask').style.visibility='hidden';
+	$(dlg).style.visibility='hidden';
+}
+
+// set bytes in a buffer
+function writeUTFBytes(view, offset, string)
+{
+	var lng = string.length;
+	for (var i = 0; i < lng; i++) {
+		view.setUint8(offset + i, string.charCodeAt(i));
+	}
+}
+
+// make a TXT file from annotations
+function makeTXT(title,subtitle,ctab)
+{
+	var txt="";
+
+	txt += "<h1>"+title+"</h1><p align='center'>"+subtitle+"</p>\n";
+	var coffset=ctab[0].start-0.1;
+	if (coffset < 0) coffset=0;
+	for (var i=0;i<ctab.length-1;i++) {
+		txt += (ctab[i].start-coffset).toFixed(3)+","+(ctab[i].stop-coffset).toFixed(3)+","+ctab[i].wrd+"\n";
+		var fstart=Math.round(ctab[i].start*FXRATE);
+		var fend=Math.round(ctab[i].stop*FXRATE);
+		txt += cfx[fstart].toFixed(1);
+		fstart++;
+		while (fstart < fend) {
+			txt += ","+cfx[fstart].toFixed(1);
+			fstart++;
+		}
+		txt += "\n";
+	}
+
+	var buffer = new ArrayBuffer(txt.length);
+	var view = new DataView(buffer);
+	writeUTFBytes(view, 0, txt);
+
+	// our final binary blob
+	var blob = new Blob ( [ view ], { type : 'text/plain' } );
+	return blob;
+}
+
+// make a WAV file from signal
+function makeWAV(signal)
+{
+	var	ssamp=0,nsamp=signal.length;
+
+	// if annnotations available, crop signal
+	if (ctab.length > 0) {
+		ssamp = Math.round((ctab[0].start-0.1)*SRATE);
+		if (ssamp < 0) ssamp=0;
+		var esamp=Math.round((ctab[ctab.length-1].start+0.1)*SRATE);
+		if (esamp > signal.length) esamp=signal.length;
+		nsamp=esamp-ssamp;
+	}
+
+	var buffer = new ArrayBuffer(44 + nsamp * 2);
+	var view = new DataView(buffer);
+
+  // RIFF chunk descriptor
+	writeUTFBytes(view, 0, 'RIFF');
+	view.setUint32(4, 44 + nsamp * 2, true);
+	writeUTFBytes(view, 8, 'WAVE');
+	// FMT sub-chunk
+	writeUTFBytes(view, 12, 'fmt ');
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true);
+	view.setUint16(22, 1, true);
+	view.setUint32(24, SRATE, true);
+	view.setUint32(28, SRATE * 2, true);
+  	view.setUint16(32, 2, true);
+  	view.setUint16(34, 16, true);
+	// data sub-chunk
+	writeUTFBytes(view, 36, 'data');
+	view.setUint32(40, nsamp * 2, true);
+
+	// write the PCM samples
+	var index = 44;
+	for (var i = 0; i < nsamp; i++) {
+		view.setInt16(index, signal[ssamp+i] * 30000, true);
+		index += 2;
+	}
+
+	// our final binary blob
+	var blob = new Blob ( [ view ], { type : 'audio/wav' } );
+	return blob;
+}
+
+// save audio file
+function doSaveAudio()
+{
+	var a = document.createElement('a');
+	a.href = window.URL.createObjectURL(makeWAV(csignal));
+	a.download = 'download.wav';
+	var event = document.createEvent("MouseEvents");
+  event.initMouseEvent(
+       "click", true, false, window, 0, 0, 0, 0, 0
+       , false, false, false, false, 0, null
+  );
+  a.dispatchEvent(event);
+//	a.click();
+}
+
+// save text file
+function doSaveText() {
+	var a = document.createElement('a');
+	a.href = window.URL.createObjectURL(makeTXT($('title').value,$('subtitle').value,ctab));
+	a.download = 'download.txt';
+	var event = document.createEvent("MouseEvents");
+	event.initMouseEvent(
+       "click", true, false, window, 0, 0, 0, 0, 0
+       , false, false, false, false, 0, null
+	);
+	a.dispatchEvent(event);
+}
+
+// open a file
+function onopenfiledlg()
+{
+	$('mask').style.visibility='hidden';
+	$('openfiledlg').style.visibility='hidden';
+	var file = $('filechoice').files[0];
+	filename = file.name;
+
+	createcontext();
+
+	var reader = new FileReader();
+	reader.onload = function(e) {
+//		trace("reader.readyState="+reader.readyState);
+		filedata = e.target.result;
+//		trace("filedata.length="+filedata.byteLength);
+		fileblob = new Blob([filedata], {type: 'audio/wav'});
+		fileurl = URL.createObjectURL(fileblob);
+	    context.decodeAudioData(filedata,
+			function onSuccess(buffer) {
+				var siglen = buffer.length;
+  				if (siglen/SRATE > MAXRECORD) siglen=Math.floor(MAXRECORD*SRATE);
+				var srcbuf = buffer.getChannelData(0);
+				csigmax=0;
+				for (i=0;i<siglen;i++) {
+					var s = srcbuf[i];
+					if (s > csigmax) csigmax=s;
+		            if (s < -csigmax) csigmax = -s;
+  				}
+				csignal = new Float32Array(siglen);
+				for (i=0;i<siglen;i++) {
+					csignal[i] = srcbuf[i]/csigmax;
+				}
+				// initialise time stack
+				fstack=[];
+				fstack.push([0, csignal.length/SRATE]);
+				displaysignal("wgraph");
+				dopitch();
+    		},
+    		function onFailure() {
+    			trace("decodeAudioData failed");
+    		}
+    	);
+	};
+	reader.readAsArrayBuffer(file);
+}
+
+// load file
+function doLoad()
+{
+	$('mask').style.visibility='visible';
+	var dlg=$('openfiledlg');
+	dlg.style.top = screensize().cy - dlg.offsetHeight/2;
+	dlg.style.left = screensize().cx - dlg.offsetWidth/2;
+	dlg.style.visibility='visible';
+}
+
+// about
+function doAbout()
+{
+	$('mask').style.visibility='visible';
+	var dlg=$('aboutdlg');
+	dlg.style.top = screensize().cy - dlg.offsetHeight/2;
+	dlg.style.left = screensize().cx - dlg.offsetWidth/2;
+	dlg.style.visibility='visible';
+}
+
+// do contents page
+function doContents()
+{
+	window.location.href="index.html";
+}
+
+// drag word boundaries
+var dragging=0;
+var widx=0;
+var	tmin,tmax;
+
+function mousedown(event)
+{
+	var	i,dmin;
+	var pos=annotgraph.getEventPosition(event);
+	// trace("mousedown at "+pos.x+","+pos.y);
+
+	widx=-1;
+	if (event.button==0) {
+		dmin=1e6;
+		for (i=0;i<ctab.length;i++) {
+			if (Math.abs(ctab[i].start-pos.x) < dmin) {
+				dmin=Math.abs(ctab[i].start-pos.x);
+				widx=i;
+			}
+		}
+		// trace("widx="+widx+" dmin="+dmin);
+		if ((event.button==0)&&(dmin < 0.05)) {
+			dragging=1;
+			event.originalEvent.preventDefault();		// stop chrome from showing text cursor
+			$('agraph').style.cursor="move";
+			if (widx>0)
+				tmin=ctab[widx-1].start+0.01;
+			else
+				tmin=0.01;
+			if (widx+1<ctab.length)
+				tmax=ctab[widx+1].start-0.01;
+			else
+				tmax=csignal.length/SRATE-0.01;
+			if ((tmin<pos.x)&&(pos.x<tmax)) ctab[widx].start = pos.x;
+			adjustannot();
+			displayannot("agraph");
+		}
+		else {
+			for (i=0;i<ctab.length;i++) {
+				if ((ctab[i].start<=pos.x)&&(pos.x<ctab[i].stop)) widx=i;
+			}
+		}
+
+	}
+	else {
+		for (i=0;i<ctab.length;i++) {
+			if ((ctab[i].start<=pos.x)&&(pos.x<ctab[i].stop)) widx=i;
+		}
+	}
+}
+
+function mousemove(event,pos)
+{
+	if (dragging==1) {
+		// trace("mousemove at "+pos.x+","+pos.y);
+		if ((tmin<pos.x)&&(pos.x<tmax)) ctab[widx].start = pos.x;
+		adjustannot();
+		displayannot("agraph");
+	}
+}
+
+function mouseup(event)
+{
+	var pos=annotgraph.getEventPosition(event);
+	// trace("mouseup at "+pos.x+","+pos.y);
+	if (dragging==1) {
+		$('agraph').style.cursor="default";
+		if ((tmin<pos.x)&&(pos.x<tmax)) ctab[widx].start = pos.x;
+		adjustannot();
+		displayannot("agraph");
+		dragging=0;
+	}
+	if (pos.x < ctab[0].start)
+		playaudio(csignal,0,ctab[0].start);
+	else if (widx>=0)
+		playaudio(csignal,ctab[widx].start,ctab[widx].stop);
+}
+
+
+// set up the word list
+function dosetwords()
+{
+	var	etime=csignal.length/SRATE;
+
+	// find number of words
+	var nwd=0;
+	for (var i=1;i<=16;i++) {
+		if ($("word"+i).value=="") break;
+		nwd++;
+	}
+	trace("nwd="+nwd);
+	ctab = new Array(nwd+1);
+	for (var i=0;i<nwd;i++) {
+		ctab[i]={};
+		ctab[i].wrd = $("word"+(i+1)).value;
+		ctab[i].start= (i+1)*etime/(nwd+2);
+	}
+	ctab[nwd]={};
+	ctab[nwd].wrd="/";
+	ctab[nwd].start=(nwd+1)*etime/(nwd+2);
+
+	adjustannot();
+	displayannot("agraph");
+}
+
+// draw the graphs
+function dographs()
+{
+	displaysignal("wgraph");
+	displaypitch("fgraph");
+	displayannot("agraph");
+}
+
+// set sizes of graphs to fit screen
+function doresize()
+{
+	// main div
+	var mwidth=screensize().width-2;
+	var mheight=screensize().height-95;
+	$("main").style.width=mwidth+"px";
+	$("main").style.height=mheight+"px";
+
+	// graphs
+	var wwidth=mwidth-15;
+	var wheight=Math.floor((mheight-35)/7);
+	$("content").style.width=(wwidth-10)+"px";
+	$("content").style.height=(2*wheight)+"px";
+	$("inputtable").style.height=(2*wheight-10)+"px";
+	$("wgraph").style.width=wwidth+"px";
+	$("wgraph").style.height=(2*wheight)+"px";
+	$("fgraph").style.width=wwidth+"px";
+	$("fgraph").style.height=(2*wheight)+"px";
+	$("agraph").style.width=wwidth+"px";
+	$("agraph").style.height=wheight+"px";
+
+	$("vumeter").width=200;
+	$("vumeter").height=50;
+	var cpos=$('wgraph').getBoundingClientRect();
+	$("recmask").style.top=cpos.top;
+	$("recmask").style.left=cpos.left;
+	$("recmask").style.width=wwidth+"px";
+	$("recmask").style.height=(5*wheight)+"px";
+	dographs();
+}
+
+// initialise whole page
+function initialise() {
+	// initialise time stack
+	fstack=[];
+	fstack.push([0, 1]);
+	// resize and draw graphs
+	doresize();
+	// add event listeners for annotation
+	var sg=document.getElementById("agraph");
+	Flotr.EventAdapter.observe(sg, 'flotr:mousedown', mousedown);
+	Flotr.EventAdapter.observe(sg, 'flotr:mousemove', mousemove);
+	Flotr.EventAdapter.observe(sg, 'flotr:mouseup', mouseup);
+}
+
+</script>
+
+</head>
+<body onload="initialise()" onresize="doresize()" oncontextmenu="return false;">
+
+<div id="menubar">
+<div class="menubutton" onclick="doAbout()"><img src="improslogo.png"></div>
+<div class="menulabel">AUTHOR</div>
+<div class="menubutton" onclick="doContents()";>Contents</div>
+<div class="menubutton" onclick="doLoad()";>Load</div>
+<div class="menubutton" onclick="doRecord()";>Record</div>
+<div class="menubutton" onclick="doPlay()";>Play</div>
+<div class="menulabel">SAVE</div>
+<div class="menubutton" onclick="doSaveAudio()";>Audio</div>
+<div class="menubutton" onclick="doSaveText()";>Text</div>
+</div>
+
+<div id="main">
+
+<div class="textpanel" id="content">
+<table id="inputtable">
+<tr><td align="right">Main&nbsp;Title:</td><td align="left" colspan="2"><input type="text" class="inputfield" id="title" size="72" value="Enter main title here"></td>
+<tr><td align="right">Sub&nbsp;Title:</td><td align="left" colspan="2"><input type="text" class="inputfield" id="subtitle" size="72" value="Enter instructions here"></td>
+<tr><td align="right">Word&nbsp;List:</td><td align="left">
+<input type="text" class="inputfield" id="word1" size="10" value="one">
+<input type="text" class="inputfield" id="word2" size="10" value="two">
+<input type="text" class="inputfield" id="word3" size="10" value="three">
+<input type="text" class="inputfield" id="word4" size="10">
+<input type="text" class="inputfield" id="word5" size="10">
+<input type="text" class="inputfield" id="word6" size="10">
+<input type="text" class="inputfield" id="word7" size="10">
+<input type="text" class="inputfield" id="word8" size="10">
+<input type="text" class="inputfield" id="word9" size="10">
+<input type="text" class="inputfield" id="word10" size="10">
+<input type="text" class="inputfield" id="word11" size="10">
+<input type="text" class="inputfield" id="word12" size="10">
+<input type="text" class="inputfield" id="word13" size="10">
+<input type="text" class="inputfield" id="word14" size="10">
+<input type="text" class="inputfield" id="word15" size="10">
+<input type="text" class="inputfield" id="word16" size="10">
+</td><td>
+<input type="button" class="button" onclick="dosetwords()" value="Set Words">
+</td>
+</tr>
+</table>
+</div>
+
+<div class="graph" id="wgraph"></div>
+<div class="graph" id="fgraph"></div>
+<div class="graph" id="agraph"></div>
+
+
+</div>
+
+<div id="footer">
+	<div align='right' id='fcredits'>
+	&copy; 2015 Mark Huckvale University College London
+	</div>
+</div>
+
+<!-- Screen overlay mask -->
+<div id="mask" class="background" style="visibility:hidden"></div>
+
+<!-- Screen overlay mask for recording -->
+<div id="recmask" class="mask" style="visibility:hidden"></div>
+
+<!-- Load File Dialog -->
+<div id="openfiledlg" class="modal" style="visibility:hidden">
+<table border="0" cellpadding="3" cellspacing="3" width="100%">
+<tr><td><h3>Select Audio File</h3></td></tr>
+<tr><td height="60px"><input class="inputfile" type="file" id="filechoice"></td></tr>
+<tr><td><button class="button" onclick="onopenfiledlg()">OK</button><button class="button" onclick="cancel('openfiledlg')">Cancel</button></td></tr>
+</table>
+</div>
+
+<!-- Record Dialog -->
+<div id="recorddlg" class="modal" style="visibility:hidden">
+<table border="0" cellpadding="3" cellspacing="3" width="100%">
+<tr><td><h3>Recording</h3></td></tr>
+<tr><td><i>Click above to enable recording</i></td></tr>
+<tr><td height="60px"><canvas class="vumeter" id="vumeter"></canvas></td></tr>
+<tr><td><button class="button" onclick="onrecorddlg()">OK</button></td></tr>
+</table>
+</div>
+
+<!-- About Dialog -->
+<div id="aboutdlg" class="modal" style="visibility:hidden">
+<table border="0" cellpadding="3" cellspacing="3" width="100%">
+<tr><td><h3>IMPROS</h3>
+<p>Improve Your Prosody
+<p>Version 1.0
+<p>&copy; 2015 Mark Huckvale
+<p>University College London
+<p>January 2015
+</td></tr>
+<tr><td><button class="button" onclick="cancel('aboutdlg')">OK</button></td></tr>
+</table>
+</div>
+
+</body>
+
+
+</html>
